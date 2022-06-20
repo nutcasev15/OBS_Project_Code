@@ -1,0 +1,122 @@
+#include <Arduino.h>
+#include <wiring_private.h>
+
+
+volatile bool prev = false;
+
+void setup() {
+  // Write 20 mV Approximate Reference Value (Measured 15 mV) to DAC for AC0
+  // Voltage Divider HW Configuration:
+  // VCC -- 10K -- Switch Wire Tap to AC0 Input (Measured 34 mV) -- 100 -- GND
+  analogWrite(A0, (uint8_t)((0.02 / 3.3) * 255.0));
+  // Make DAC Output Available to AC Module
+  DAC->CTRLB.bit.IOEN = 1;
+  while(DAC->STATUS.bit.SYNCBUSY); // Wait Until Sync
+
+  // Begin AC0 Setup
+  // Ref: https://forum.arduino.cc/t/analogcomparator-for-arduino-zero/319233
+  PM->APBCMASK.bit.AC_ = 1; // Power Up AC Module
+  GCLK->CLKCTRL.reg = GCLK_CLKCTRL_CLKEN | GCLK_CLKCTRL_GEN(0) | GCLK_CLKCTRL_ID_AC_DIG; // Send GCLK0 Clock to AC Digital Clock
+  GCLK->CLKCTRL.reg = GCLK_CLKCTRL_CLKEN | GCLK_CLKCTRL_GEN(1) | GCLK_CLKCTRL_ID_AC_ANA; // Send GCLK0 Clock to AC Analog Clock
+  AC->CTRLA.bit.ENABLE = 0; // Disable AC Module
+  AC->CTRLA.bit.SWRST = 1; // Reset AC Module
+  AC->EVCTRL.bit.COMPEO0 = 1; // Set AC0 to Generate Event on Output
+
+  // Disable All AC Module Interrupts
+  AC->INTENCLR.bit.COMP0 = 1; // Disable AC0 Interrupt
+  AC->INTENCLR.bit.COMP1 = 1; // Disable AC1 Interrupts
+  AC->INTENCLR.bit.WIN0 = 1; // Disable Window Monitor 0 Interrupts
+
+  // Configure AC0
+  AC->COMPCTRL[0].bit.FLEN = AC_COMPCTRL_FLEN_OFF_Val; // Disable Digital Output Filter
+  AC->COMPCTRL[0].bit.INTSEL = AC_COMPCTRL_INTSEL_TOGGLE_Val; // Generate Event on Toggle
+  AC->COMPCTRL[0].bit.SINGLE = 0; // Enable Free Running Mode
+  AC->COMPCTRL[0].bit.MUXNEG = AC_COMPCTRL_MUXNEG_DAC_Val; // Set DAC Output as AC0 Input
+  AC->COMPCTRL[0].bit.MUXPOS = AC_COMPCTRL_MUXPOS_PIN0_Val; // Set Pin A3 as AC0 Input
+  // Set A3 as Analog IO Pin
+  // Voltage Divider Switch Output and 10K Pull Down Resistor Connected Here 
+  pinPeripheral(A3, PIO_ANALOG);
+  AC->COMPCTRL[0].bit.SPEED = AC_COMPCTRL_SPEED_HIGH_Val; // Improve Response Time of AC0 using More Power
+  AC->COMPCTRL[0].bit.ENABLE = 1; // Enable AC0
+
+  // Configure EVSYS Module for AC0 Event Handling
+  PM->APBCMASK.bit.EVSYS_ = 1; // Power Up EVSYS Module
+  GCLK->CLKCTRL.reg = GCLK_CLKCTRL_CLKEN | GCLK_CLKCTRL_GEN(0) | GCLK_CLKCTRL_ID_EVSYS_0; // Send Generator 0 Clock to EVSYS Channel 0
+  EVSYS->CTRL.bit.SWRST = 1; // Reset EVSYS Module
+
+  // Disable EVSYS Channel 0 Interrupts
+  EVSYS->INTENCLR.bit.EVD0 = 1; // Disable Interrupt on Event Detection
+  EVSYS->INTENCLR.bit.OVR0 = 1; // Disable Interrupt on Channel Overrun
+
+  // Configure EVSYS Channel 0
+  // Ref: https://forum.arduino.cc/t/arduino-zero-sam-d21-hardware-counter-as-simple-input-counter-intialization/630306/2
+  EVSYS->CHANNEL.bit.CHANNEL = EVSYS_CHANNEL_CHANNEL(0); // Select EVSYS Channel 0
+  EVSYS->CHANNEL.reg |= EVSYS_CHANNEL_EVGEN(EVSYS_ID_GEN_AC_COMP_0); // Set Event Source as AC0
+  EVSYS->CHANNEL.bit.EDGSEL = EVSYS_CHANNEL_EDGSEL_BOTH_EDGES_Val; // Enable Event Edge Detection for All Edges
+  EVSYS->CHANNEL.bit.PATH = EVSYS_CHANNEL_PATH_RESYNCHRONIZED_Val; // Use Resynchronous Clock for Generator and User of Event
+
+  // Configure EVSYS Channel 0 User
+  EVSYS->USER.reg = EVSYS_USER_CHANNEL(1) | // Select EVSYS Channel 0 Output
+                    EVSYS_USER_USER(EVSYS_ID_USER_TC5_EVU); // Send Event to TC5 for Counter Clocking
+
+  // Begin TC5 Setup
+  PM->APBCMASK.bit.TC5_ = 1; // Power Up TC5 Module
+  GCLK->CLKCTRL.reg = GCLK_CLKCTRL_CLKEN | GCLK_CLKCTRL_GEN(0) | GCLK_CLKCTRL_ID_TC4_TC5; // Send GCLK0 Clock to TC5 HW
+  TC5->COUNT16.CTRLA.bit.ENABLE = 0; // Disable TC5
+  while(TC5->COUNT16.STATUS.bit.SYNCBUSY); // Wait Until Sync
+  TC5->COUNT16.CTRLA.bit.SWRST = 1; // Reset TC5
+  while(TC5->COUNT16.STATUS.bit.SYNCBUSY); // Wait Until Sync
+
+  // Configure TC5
+  TC5->COUNT16.CTRLA.bit.MODE = TC_CTRLA_MODE_COUNT16_Val; // Select 16 Bit Mode for TC5
+  TC5->COUNT16.CTRLA.bit.PRESCALER = TC_CTRLA_PRESCALER_DIV1_Val; // Do not Divide Internal Clock
+  TC5->COUNT16.CTRLA.bit.PRESCSYNC = TC_CTRLA_PRESCSYNC_GCLK_Val; // Reload Counter on GCLK Tick
+  TC5->COUNT16.CTRLA.bit.WAVEGEN = TC_CTRLA_WAVEGEN_MFRQ_Val; // Toggle Output Waveform Value on Match Only, Reload on CC1 Match
+  while(TC5->COUNT16.STATUS.bit.SYNCBUSY); // Wait Until Sync
+  TC5->COUNT16.CTRLBCLR.bit.DIR = 1; // Set Counter to Count Up
+  while(TC5->COUNT16.STATUS.bit.SYNCBUSY); // Wait Until Sync
+
+  // Attach AC0 Event Output to TC5
+  TC5->COUNT16.EVCTRL.bit.TCEI = 1; // Enable Event Input to TC5
+  TC5->COUNT16.EVCTRL.bit.EVACT = TC_EVCTRL_EVACT_COUNT_Val; // Set Input Event as Clock to TC5
+  while(TC5->COUNT16.STATUS.bit.SYNCBUSY); // Wait Until Sync
+
+  // Disable all TC5 Interrupts
+  TC5->COUNT16.INTENCLR.bit.ERR = 1; // Disable Interrupt on Error
+  TC5->COUNT16.INTENCLR.bit.MC0 = 1; // Disable Interrupt on Compare0/Capture0 Match
+  TC5->COUNT16.INTENCLR.bit.MC1 = 1; // Disable Interrupt on Compare1/Capture1 Match
+  TC5->COUNT16.INTENCLR.bit.OVF = 1; // Disable Interrupt on Timer Overflow
+  TC5->COUNT16.INTENCLR.bit.SYNCRDY = 1; // Disable Interrupt on Timer R/W Sync
+  while(TC5->COUNT16.STATUS.bit.SYNCBUSY); // Wait Until Sync
+
+  // Setup TC5 Compare Values
+  TC5->COUNT16.CC[0].bit.CC = 0X00; // Set Lower Toggle Trigger Value as 0
+  TC5->COUNT16.CC[1].bit.CC = 0X01; // Set Higher Toggle Trigger Value as 1
+  while(TC5->COUNT16.STATUS.bit.SYNCBUSY); // Wait Until Sync
+
+  // Setup TC5 Waveform Pin Outputs on D4 and D5 Pins
+  pinPeripheral(4, PIO_TIMER);
+  pinPeripheral(5, PIO_TIMER); // Outputs Inverted Waveform Compared to D4 Pin
+
+  // Setup Pin D1 to Sense TC5 Waveform Output
+  // pinMode(1, INPUT);
+
+  // Setup Serial to Output Read Value to Serial in IDE
+  // Serial.begin(115200);
+
+  // Enable AC Module and Start AC0 Comparisions
+  AC->CTRLA.bit.ENABLE = 1;
+  AC->CTRLB.bit.START0 = 1;
+  // Enable TC5 and Start Count
+  TC5->COUNT16.CTRLA.bit.ENABLE = 1;
+  while(TC5->COUNT16.STATUS.bit.SYNCBUSY); // Wait Until Sync
+}
+
+void loop() { 
+  // Read TC5 Waveform Output from D4 Pin on D1 Pin
+  // Output to IDE Serial Monitor on TC5 Waveform Toggle
+  // if(prev != digitalRead(1)) {
+  //   prev = !prev;
+  //   Serial.println(prev);
+  // }
+}
